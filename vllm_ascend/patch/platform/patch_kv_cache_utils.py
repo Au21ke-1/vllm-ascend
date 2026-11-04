@@ -51,6 +51,14 @@ from vllm_ascend.models.qwen4_exp.cache_config import (
     get_qwen4_exp_max_memory_usage,
     get_qwen4_exp_pool_bytes_per_block,
 )
+from vllm_ascend.models.step5.cache_config import (
+    get_step5_kv_cache_config_from_groups,
+    get_step5_kv_cache_groups,
+    get_step5_max_concurrency,
+    get_step5_max_memory_usage,
+    get_step5_pool_bytes_per_block,
+    is_step5_groups,
+)
 from vllm_ascend.quantization.methods.kv_cache.turboquant import TURBOQUANT_CACHE_DTYPE
 from vllm_ascend.quantization.methods.kv_cache.turboquant import cache as tq_cache
 from vllm_ascend.utils import vllm_version_is
@@ -633,6 +641,8 @@ def _ascend_pool_bytes_per_block(  # type: ignore[misc]
     """
     if tq_cache.uses_turboquant_groups(kv_cache_groups):
         return tq_cache.pool_bytes_per_block(kv_cache_groups)
+    if is_step5_groups(kv_cache_groups):
+        return get_step5_pool_bytes_per_block(kv_cache_groups)
     if is_deepseek_v41_cache(kv_cache_groups):
         return get_deepseek_v41_pool_bytes_per_block(kv_cache_groups)
     if _get_glm5_next_cache_layout(kv_cache_groups) is not None:
@@ -647,42 +657,112 @@ def _ascend_pool_bytes_per_block(  # type: ignore[misc]
     return sum(page_sizes) * num_layer_tuples
 
 
-def _ascend_max_memory_usage_bytes_from_groups(
-    builder: Any,
-    vllm_config: VllmConfig,
+def _has_ascend_multi_allocation_kv_cache_layout(
     kv_cache_groups: list[KVCacheGroupSpec],
-) -> int:
-    """Keep Ascend admission accounting with the upstream builder API."""
-    if tq_cache.uses_turboquant_groups(kv_cache_groups):
-        return tq_cache.max_memory_usage(vllm_config, kv_cache_groups)
-    if _get_glm5_next_cache_layout(kv_cache_groups) is not None:
-        return get_glm5_next_max_memory_usage(vllm_config, kv_cache_groups)
-    qwen_bytes = get_qwen4_exp_max_memory_usage(vllm_config, kv_cache_groups)
-    if qwen_bytes is not None:
-        return qwen_bytes
-    if not _is_deepseek_v4_groups(kv_cache_groups):
-        return _orig_max_memory_usage_bytes_from_groups(builder, vllm_config, kv_cache_groups)
+) -> bool:
+    """Whether Ascend materializes these groups as several device allocations."""
+    return (
+        tq_cache.uses_turboquant_groups(kv_cache_groups)
+        or is_step5_groups(kv_cache_groups)
+        or is_deepseek_v41_cache(kv_cache_groups)
+        or _get_glm5_next_cache_layout(kv_cache_groups) is not None
+        or _is_deepseek_v4_groups(kv_cache_groups)
+    )
 
-    assert all(isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs) for group in kv_cache_groups)
-    full_mla_spec = kv_cache_groups[0].kv_cache_spec
-    assert isinstance(full_mla_spec, UniformTypeKVCacheSpecs)
-    layer_tuple_bytes = sum(_page_sizes(full_mla_spec))
-    num_layer_tuples = max(
-        _get_max_layers_per_page_size(group.kv_cache_spec)
-        for group in kv_cache_groups
-        if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
-    )
-    return sum(
-        num_layer_tuples * group.kv_cache_spec.max_memory_usage_pages(vllm_config) * layer_tuple_bytes
-        for group in kv_cache_groups
-        if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
-    )
+# vLLM #42309 threads the platform's ``KVCacheConfigBuilder`` through KV cache
+# admission on main, so ``_max_memory_usage_bytes_from_groups`` gained a leading
+# ``builder`` argument. The v0.32.0 lane keeps the pre-#42309 two-argument
+# signature.
+if vllm_version_is("0.32.0"):
+
+    def _ascend_max_memory_usage_bytes_from_groups(
+        vllm_config: VllmConfig,
+        kv_cache_groups: list[KVCacheGroupSpec],
+    ) -> int:
+        """Keep the pre-#51718 DSV4 admission formula for its shared tuples."""
+        if is_step5_groups(kv_cache_groups):
+            return get_step5_max_memory_usage(vllm_config, kv_cache_groups)
+        if tq_cache.uses_turboquant_groups(kv_cache_groups):
+            return tq_cache.max_memory_usage(vllm_config, kv_cache_groups)
+        if _get_glm5_next_cache_layout(kv_cache_groups) is not None:
+            return get_glm5_next_max_memory_usage(vllm_config, kv_cache_groups)
+        qwen_bytes = get_qwen4_exp_max_memory_usage(vllm_config, kv_cache_groups)
+        if qwen_bytes is not None:
+            return qwen_bytes
+        if not _is_deepseek_v4_groups(kv_cache_groups):
+            return _orig_max_memory_usage_bytes_from_groups(vllm_config, kv_cache_groups)
+
+        assert all(isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs) for group in kv_cache_groups)
+        full_mla_spec = kv_cache_groups[0].kv_cache_spec
+        assert isinstance(full_mla_spec, UniformTypeKVCacheSpecs)
+        layer_tuple_bytes = sum(_page_sizes(full_mla_spec))
+        num_layer_tuples = max(
+            _get_max_layers_per_page_size(group.kv_cache_spec)
+            for group in kv_cache_groups
+            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+        )
+        return sum(
+            num_layer_tuples * group.kv_cache_spec.max_memory_usage_pages(vllm_config) * layer_tuple_bytes
+            for group in kv_cache_groups
+            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+        )
+
+else:
+
+    def _ascend_max_memory_usage_bytes_from_groups(*args: Any) -> int:  # type: ignore[misc]
+        """Keep the pre-#51718 DSV4 admission formula for its shared tuples.
+
+        vLLM #42309 threads a ``KVCacheConfigBuilder`` through KV cache
+        admission on main, so the call becomes
+        ``(builder, vllm_config, kv_cache_groups)``, while main checkouts
+        predating #42309 still call ``(vllm_config, kv_cache_groups)``.
+        ``vllm_version_is`` cannot separate two main dev builds, so dispatch on
+        the argument count.
+        """
+        if len(args) == 3:
+            builder, vllm_config, kv_cache_groups = args
+        else:
+            builder = None
+            vllm_config, kv_cache_groups = args
+        if is_step5_groups(kv_cache_groups):
+            return get_step5_max_memory_usage(vllm_config, kv_cache_groups)
+        if tq_cache.uses_turboquant_groups(kv_cache_groups):
+            return tq_cache.max_memory_usage(vllm_config, kv_cache_groups)
+        if _get_glm5_next_cache_layout(kv_cache_groups) is not None:
+            return get_glm5_next_max_memory_usage(vllm_config, kv_cache_groups)
+        qwen_bytes = get_qwen4_exp_max_memory_usage(vllm_config, kv_cache_groups)
+        if qwen_bytes is not None:
+            return qwen_bytes
+        if not _is_deepseek_v4_groups(kv_cache_groups):
+            if builder is None:
+                return _orig_max_memory_usage_bytes_from_groups(vllm_config, kv_cache_groups)
+            return _orig_max_memory_usage_bytes_from_groups(builder, vllm_config, kv_cache_groups)
+
+        assert all(isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs) for group in kv_cache_groups)
+        full_mla_spec = kv_cache_groups[0].kv_cache_spec
+        assert isinstance(full_mla_spec, UniformTypeKVCacheSpecs)
+        layer_tuple_bytes = sum(_page_sizes(full_mla_spec))
+        num_layer_tuples = max(
+            _get_max_layers_per_page_size(group.kv_cache_spec)
+            for group in kv_cache_groups
+            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+        )
+        return sum(
+            num_layer_tuples * group.kv_cache_spec.max_memory_usage_pages(vllm_config) * layer_tuple_bytes
+            for group in kv_cache_groups
+            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+        )
 
 
 def _get_ascend_kv_cache_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> list[KVCacheGroupSpec]:
+    step5_groups = get_step5_kv_cache_groups(
+        vllm_config, kv_cache_spec, _orig_get_kv_cache_groups
+    )
+    if step5_groups is not None:
+        return step5_groups
     if any(is_glm5_next_cache_spec(spec) for spec in kv_cache_spec.values()):
         return get_glm5_next_kv_cache_groups(vllm_config, kv_cache_spec)
     groups = get_qwen4_exp_kv_cache_groups(vllm_config, kv_cache_spec, _orig_get_kv_cache_groups)
@@ -711,7 +791,11 @@ def _ascend_get_kv_cache_config_from_groups(
         if vllm_version_is("0.28.0")
         else get_qwen4_exp_kv_cache_config(vllm_config, kv_cache_groups, available_memory)
     )
-    if qwen_config is not None:
+    if is_step5_groups(kv_cache_groups):
+        kv_cache_config = get_step5_kv_cache_config_from_groups(
+            vllm_config, kv_cache_groups, available_memory
+        )
+    elif qwen_config is not None:
         kv_cache_config = qwen_config
     elif is_deepseek_v41_cache(kv_cache_groups):
         kv_cache_config = get_deepseek_v41_kv_cache_config(vllm_config, kv_cache_groups, available_memory)
@@ -759,7 +843,33 @@ def _ascend_get_kv_cache_config_from_groups(
     return kv_cache_config
 
 
+_orig_get_max_concurrency_for_kv_cache_config = (
+    vllm.v1.core.kv_cache_utils.get_max_concurrency_for_kv_cache_config
+)
+
+
+def _ascend_get_max_concurrency_for_kv_cache_config(
+    vllm_config: VllmConfig,
+    kv_cache_config: KVCacheConfig,
+) -> float:
+    """Honest capacity for Step5's per-page-size backings.
+
+    Upstream sums every group's block demand into one pool, but Step5's
+    backings are split by page size and each backing holds ``num_blocks``
+    ids of its own, so the binding constraint is the per-class sum and the
+    "KV cache size" line must not report tokens a single request can never
+    fit (sliding-window demand saturates once the window covers the chunk,
+    so linear scaling overstates the longest servable prompt).
+    """
+    if not is_step5_groups(kv_cache_config.kv_cache_groups):
+        return _orig_get_max_concurrency_for_kv_cache_config(vllm_config, kv_cache_config)
+    return get_step5_max_concurrency(vllm_config, kv_cache_config)
+
+
 vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes
+vllm.v1.core.kv_cache_utils.get_max_concurrency_for_kv_cache_config = (
+    _ascend_get_max_concurrency_for_kv_cache_config
+)
 assert _orig_get_packed_kv_cache_groups is not None
 if _orig_annotate_eagle_groups is not None:
     _kv_cache_planning._annotate_eagle_groups = _ascend_annotate_eagle_groups
