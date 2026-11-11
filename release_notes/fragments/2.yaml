@@ -1,0 +1,4 @@
+pr: 2
+entries:
+  - category: bugfix
+    text: Fixed Step-5 Memcache layerwise load/save ordering for main KV and CSA summaries.

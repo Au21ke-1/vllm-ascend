@@ -62,6 +62,35 @@ For non-layerwise complete-block transfers, adjacent MLA components sharing one 
 
 This bulk fast path uses physical-page-major object contents instead of the previous component-major segmented contents. A fresh namespace is required even when upgrading from the earlier segmented version of this fix. Writers and readers must agree on transfer mode and cache layout; do not share these objects with layerwise readers or workers using a different component layout.
 
+## Step-5 Memcache Prefix Reuse
+
+This configuration assumes the Step-5 model support from
+[vllm-ascend#20946](https://github.com/vllm-project/vllm-ascend/pull/20946).
+The existing multi-group pool handles main KV and CSA summaries; the
+request-private tail ring is excluded from external prefix storage.
+
+For eager layerwise transfers, configure `AscendStoreConnector` as follows:
+
+```json
+{
+  "kv_connector": "AscendStoreConnector",
+  "kv_role": "kv_both",
+  "kv_load_failure_policy": "recompute",
+  "kv_connector_extra_config": {
+    "backend": "memcache",
+    "use_layerwise": true,
+    "load_async": false,
+    "lookup_rpc_port": "0"
+  }
+}
+```
+
+Use `--enforce-eager`, keep the hybrid cache manager enabled, and disable local
+prefix caching when validating external reuse. TP8, EP and MTP3 were validated
+with vLLM v0.33.0 on eight 950DT devices. Layerwise execution waits for both
+main KV and summary loads, updates summaries before opening the attention
+transfer window, and saves once per physical layer after attention submission.
+
 ## Scenario 1: Mooncake Backend
 
 ### Configuration Examples

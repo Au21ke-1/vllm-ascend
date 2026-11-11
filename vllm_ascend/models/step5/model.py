@@ -89,6 +89,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.model_executor.models.utils import make_empty_intermediate_tensors_factory
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
+from vllm_ascend.attention.utils import maybe_save_kv_layer_to_connector, wait_for_kv_layer_from_connector
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.models.common.ops.sequence_parallel import (
     sp_all_gather,
@@ -553,6 +554,8 @@ class AscendStep5DSAAttention(nn.Module, AttentionLayerBase):
             dtype=q.dtype,
             device=q.device,
         )
+        # Load main KV and CSA summary before writing the prompt remainder.
+        wait_for_kv_layer_from_connector(self.layer_name)
         self._write_kv(k, v)
         self.impl.forward(
             self,
@@ -565,6 +568,8 @@ class AscendStep5DSAAttention(nn.Module, AttentionLayerBase):
             output,
             positions,
         )
+        # Summary writes and attention have completed submission for this layer.
+        maybe_save_kv_layer_to_connector(self.layer_name, list(self.kv_cache))
         attn_output = output.view(num_tokens, self.num_heads * self.head_dim)
         if gate is not None:
             attn_output = (

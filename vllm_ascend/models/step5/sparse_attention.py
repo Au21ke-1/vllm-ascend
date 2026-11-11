@@ -53,6 +53,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
 )
 
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import attention_transfer_window
 from vllm_ascend.models.step5.generic_block_sparse_attention import (
     gbsa_expected_counts,
     gbsa_sparse_attention,
@@ -1034,46 +1035,48 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         num_tokens = md.num_actual_tokens
         self._update_summary_state(md, index_k, index_z)
 
-        key_cache, value_cache = kv_cache[0], kv_cache[1]
+        # Gate transfers after both main KV and CSA summary writes.
+        with attention_transfer_window():
+            key_cache, value_cache = kv_cache[0], kv_cache[1]
 
-        if md.num_decodes > 0:
-            n = md.num_decodes
-            decode_query_len = int(md.decode.query_len) if md.decode else 1
-            if decode_query_len > 1:
-                # MTP verify batch: every decode request contributes K+1
-                # consecutive rows (positions ctx..ctx+K).
-                total = n * decode_query_len
-                self._forward_sparse_gqa_verify(
+            if md.num_decodes > 0:
+                n = md.num_decodes
+                decode_query_len = int(md.decode.query_len) if md.decode else 1
+                if decode_query_len > 1:
+                    # MTP verify batch: every decode request contributes K+1
+                    # consecutive rows (positions ctx..ctx+K).
+                    total = n * decode_query_len
+                    self._forward_sparse_gqa_verify(
+                        md=md,
+                        query=query[:total].contiguous(),
+                        key_cache=key_cache,
+                        value_cache=value_cache,
+                        index_q=index_q[:total],
+                        weights=weights[:total],
+                        positions=positions,
+                        output=output,
+                    )
+                else:
+                    self._forward_sparse_gqa_decode(
+                        md=md,
+                        query=query[:n].contiguous(),
+                        key_cache=key_cache,
+                        value_cache=value_cache,
+                        index_q=index_q[:n],
+                        weights=weights[:n],
+                        output=output,
+                    )
+
+            if md.num_prefills > 0:
+                start = md.num_decode_tokens
+                self._forward_sparse_gqa_prefill(
                     md=md,
-                    query=query[:total].contiguous(),
+                    query=query[start:num_tokens].contiguous(),
                     key_cache=key_cache,
                     value_cache=value_cache,
-                    index_q=index_q[:total],
-                    weights=weights[:total],
-                    positions=positions,
+                    index_q=index_q[start:num_tokens],
+                    weights=weights[start:num_tokens],
                     output=output,
+                    token_offset=start,
                 )
-            else:
-                self._forward_sparse_gqa_decode(
-                    md=md,
-                    query=query[:n].contiguous(),
-                    key_cache=key_cache,
-                    value_cache=value_cache,
-                    index_q=index_q[:n],
-                    weights=weights[:n],
-                    output=output,
-                )
-
-        if md.num_prefills > 0:
-            start = md.num_decode_tokens
-            self._forward_sparse_gqa_prefill(
-                md=md,
-                query=query[start:num_tokens].contiguous(),
-                key_cache=key_cache,
-                value_cache=value_cache,
-                index_q=index_q[start:num_tokens],
-                weights=weights[start:num_tokens],
-                output=output,
-                token_offset=start,
-            )
         return output
