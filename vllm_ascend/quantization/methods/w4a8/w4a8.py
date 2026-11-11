@@ -124,6 +124,11 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
     act_quant_type: torch.dtype = torch.int8
     fused_activations = frozenset({"silu", "situ"})
 
+    def supports_fused_activation(self, activation) -> bool:
+        if not get_ascend_config().ascend_fusion_config.fusion_ops_gmmswigluquant:
+            return False
+        return super().supports_fused_activation(activation)
+
     def __init__(self):
         vllm_config = get_current_vllm_config()
         group_size = vllm_config.quant_config.quant_description.get("group_size", 0)

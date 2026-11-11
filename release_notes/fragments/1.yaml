@@ -1,0 +1,5 @@
+pr: 1
+entries:
+  - category: hardware
+    text: Added an experimental A3 BF16 eager HiSparse compatibility path using CPU residency planning and explicit Host refill. Graph capture and quantized KV are unsupported; full-model accuracy and production performance remain unqualified.
+    hardware: [A3]

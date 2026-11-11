@@ -12,11 +12,33 @@ Attention interface. Attention core arithmetic is unchanged.
 - BF16 KV and native Ascend 950 C8: E4M3FN main/Indexer values with FP32 scales.
   Main and Indexer cache dtypes are independently selectable.
 - Private Host pools per tensor-parallel rank and Core eager Host mirroring.
-- Ascend 950 with a SIMT-capable CANN 9.2 toolchain. A2/A3 are not newly qualified.
+- Ascend 950 with a SIMT-capable CANN 9.2 toolchain for the native path.
+- Experimental A3 eager compatibility path described below. A2 is not qualified.
 - TopK must satisfy the existing SFA requirement of divisibility by 128.
 
 C4, TurboQuant, INT8-format C8, context parallelism and external P/D transport
 are outside this backend's current support.
+
+## A3 eager compatibility path
+
+The A3 implementation currently requires `--enforce-eager` and unquantized
+Main/Indexer KV. Use the BF16 options below with Model Runner V2. A3 does not
+load the A5 SIMT resolver or require AIV-mapped Host memory: it resolves request
+unions on CPU, retains pinned Host pools, and transfers selected missing rows
+through ordinary H2D copies. Core continues to own allocation and completion.
+
+This functional bring-up path synchronizes metadata to CPU and is not a
+performance implementation. Graph capture and C8 are rejected. TP8 eager
+requests have been exercised with GLM-5.2 W4A8 weights and BF16 KV, but output
+differences remain in matched HiSparse ON/OFF probes, so full-model accuracy
+is not qualified. MTP, long-running stability and performance qualification
+remain separate validation work. A5 keeps its existing native resolver and
+transfer path.
+
+Resident-only requests use a vectorized CPU mapping path and skip zero-row
+refills. This reduces unnecessary metadata copies but retains CPU/NPU
+synchronization. Low-pressure profiling with zero misses does not validate
+the Host refill path; run a constrained-KV test separately.
 
 ## Build the resolver
 
