@@ -113,6 +113,13 @@ class AscendHiSparseImpl(AscendSFAImpl):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        from vllm_ascend.hisparse import a3_eager
+
+        if a3_eager.enabled():
+            if not self.vllm_config.model_config.enforce_eager:
+                raise ValueError("A3 HiSparse compatibility mode requires --enforce-eager")
+            if self.enable_sparse_sfa_c8 or getattr(getattr(self, "indexer", None), "enable_sparse_li_c8", False):
+                raise ValueError("A3 HiSparse compatibility mode requires unquantized Main and Indexer KV")
         if self.enable_sparse_sfa_turboquant:
             raise ValueError("Ascend HiSparse does not support TurboQuant")
         if self.enable_sparse_sfa_c8:
@@ -157,6 +164,13 @@ class AscendHiSparseImpl(AscendSFAImpl):
         self._kv_staging_capacity = (max_rows + 127) // 128 * 128
 
     def _fused_preprocess_type(self):
+        from vllm_ascend.hisparse import a3_eager
+
+        if a3_eager.enabled() and not self.enable_sparse_sfa_c8:
+            # Match ordinary A3 SFA's fused projection/normalization rounding.
+            # BF16 Prolog writes separate temporary caches before packing.
+            candidate = super()._fused_preprocess_type()
+            return candidate if candidate == PreprocessType.PROLOG_V3 else None
         # Reuse SFA's supported quantization/weight preparation. Its C8 Prolog
         # writes owned staging below; the HiSparse handle retains the final
         # Resident destination, row mapping and Host-mirror completion policy.
@@ -265,6 +279,20 @@ class AscendHiSparseImpl(AscendSFAImpl):
             raise ValueError("HiSparse Prolog exceeds its profiled token capacity")
         cache = self.hisparse_cache
         destination, mapping, count = cache.write_target(rows, slot_mapping.numel())
+        if not self.enable_sparse_sfa_c8:
+            latent, rope, local_slots = self._kv_workspace(hidden_states.dtype)
+            result = super()._sfa_preprocess_prolog_v3(
+                hidden_states, (latent, rope), cos, sin, local_slots[:rows], attn_metadata=attn_metadata
+            )
+            scatter_packed_kv(
+                latent.view(-1, self.kv_lora_rank)[:count],
+                rope.view(-1, self.qk_rope_head_dim)[:count],
+                destination,
+                mapping,
+                attn_metadata.query_start_loc[-1:],
+            )
+            finish_hisparse_kv_update(cache, attn_metadata)
+            return result
         resident_slots = self._direct_prolog_slots
         direct = (
             resident_slots is not None

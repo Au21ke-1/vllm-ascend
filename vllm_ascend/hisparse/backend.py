@@ -79,7 +79,14 @@ class AscendHiSparseBackend(HiSparseBackend):
                 raise RuntimeError("Ascend HiSparse requires the compiled Ascend DMA extension.") from error
             if not hasattr(torch.ops._C_ascend, "swap_blocks_batch"):
                 raise RuntimeError("Ascend HiSparse requires the Ascend swap_blocks_batch operator.")
-        _load_resolver()
+        from vllm_ascend.hisparse import a3_eager
+
+        if not a3_eager.enabled():
+            _load_resolver()
+        else:
+            logger.warning_once(
+                "A3 HiSparse uses synchronous eager compatibility planning; graph capture is unsupported."
+            )
         install_row_dma(AscendHiSparseBackend)
 
     def allocate_private_host_pool(self, size: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -92,9 +99,12 @@ class AscendHiSparseBackend(HiSparseBackend):
         return registered[:size], registered
 
     def pin_tensor(self, tensor: torch.Tensor) -> None:
+        from vllm_ascend.hisparse import a3_eager
         from vllm_ascend.hisparse.cache_ops import MappedHostTensor
 
-        tensor._hisparse_registration = MappedHostTensor(tensor)
+        tensor._hisparse_registration = (
+            a3_eager.PinnedHostTensor(tensor) if a3_eager.enabled() else MappedHostTensor(tensor)
+        )
 
     def unpin_tensor(self, tensor: torch.Tensor) -> None:
         registration = tensor._hisparse_registration
@@ -192,6 +202,12 @@ class AscendHiSparseBackend(HiSparseBackend):
         count = src.size(0)
         if count > limit and any(t.ndim != 1 or t.size(0) != count or not t.is_contiguous() for t in (src, dst, sizes)):
             raise ValueError("HiSparse D2H split requires equal-length contiguous descriptor arrays.")
+        from vllm_ascend.hisparse import a3_eager
+
+        if a3_eager.enabled():
+            # Existing A3 extension exposes the original four-argument DMA ABI.
+            torch.ops._C_ascend.swap_blocks_batch(src, dst, sizes, 1)
+            return
         submit = torch.ops._C_ascend.swap_blocks_batch
         try:
             if count <= limit:

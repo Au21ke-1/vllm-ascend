@@ -138,7 +138,12 @@ class BaseDeviceAdaptor:
         # generic scatter until fixed; A2/A3 retain their stride-aware kernel.
         if not var.is_contiguous() and not profile.supports(HardwareCapability.SCATTER_ND_STRIDED_CACHE_STORE):
             return False
-        operation(var, indices, updates)
+        try:
+            operation(var, indices, updates)
+        except RuntimeError as error:
+            if "aclnnScatterNdUpdateSk" in str(error) and "not in libopapi.so" in str(error):
+                return False
+            raise
         return True
 
     @classmethod

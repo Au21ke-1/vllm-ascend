@@ -21,6 +21,16 @@ class TestAscendW4A8DynamicFusedMoEMethod(TestBase):
     output_size = 56
 
     @patch("vllm_ascend.quantization.methods.w4a8.w4a8.get_ascend_config")
+    def test_fusion_switch_selects_unfused_activation_path(self, get_config):
+        for enabled in (True, False):
+            get_config.return_value = SimpleNamespace(
+                ascend_fusion_config=SimpleNamespace(fusion_ops_gmmswigluquant=enabled)
+            )
+            for activation in ("silu", "situ"):
+                self.assertEqual(self.quant_method.supports_fused_activation(activation), enabled)
+            self.assertFalse(self.quant_method.supports_fused_activation("unsupported"))
+
+    @patch("vllm_ascend.quantization.methods.w4a8.w4a8.get_ascend_config")
     @patch("vllm_ascend.quantization.methods.w4a8.w4a8.get_current_vllm_config")
     @patch("vllm_ascend.quantization.methods.w4a8.w4a8.get_mc2_group")
     @patch("torch.distributed.get_rank", return_value=0)

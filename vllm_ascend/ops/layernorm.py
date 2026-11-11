@@ -44,6 +44,21 @@ def _quant_description_has_norm_bias(quant_description: dict) -> bool:
     return has_norm_bias
 
 
+def _add_rms_norm_bias_fallback(x, residual, weight, bias, epsilon):
+    """Match the A3 operator's rounding when its optional library is absent."""
+    dtype = x.dtype
+    residual = (x.float() + residual.float()).to(dtype)
+    values = residual.float()
+    variance = (values.square() / values.shape[-1]).sum(-1, keepdim=True)
+    normalized = (values / torch.sqrt(variance + epsilon)).to(dtype)
+    # A3 BF16 rounds normalized values before the FP32 affine operation.
+    if dtype == torch.bfloat16:
+        output = normalized.float() * weight.float() + bias.float()
+    else:
+        output = normalized * weight.to(dtype) + bias.to(dtype)
+    return output.to(dtype), residual
+
+
 class AscendRMSNorm(RMSNorm):
     def __init__(
         self,
@@ -89,9 +104,19 @@ class AscendRMSNorm(RMSNorm):
             import vllm_ascend.vllm_ascend_C  # type: ignore[import-untyped]  # noqa: F401, PLC0415
 
             enable_custom_op()
-            x, _, residual = torch.ops._C_ascend.npu_add_rms_norm_bias(
-                x, residual, self.weight, self.bias, self.variance_epsilon
-            )
+            try:
+                x, _, residual = torch.ops._C_ascend.npu_add_rms_norm_bias(
+                    x, residual, self.weight, self.bias, self.variance_epsilon
+                )
+            except RuntimeError as error:
+                if "aclnnAddRmsNormBias" not in str(error) or "not in libopapi.so" not in str(error):
+                    raise
+                if self.bias is None:
+                    x, _, residual = torch_npu.npu_add_rms_norm(x, residual, self.weight, self.variance_epsilon)
+                else:
+                    x, residual = _add_rms_norm_bias_fallback(
+                        x, residual, self.weight, self.bias, self.variance_epsilon
+                    )
             return x, residual
 
         x, residual = torch_npu.npu_rms_norm(x, self.weight, self.variance_epsilon)

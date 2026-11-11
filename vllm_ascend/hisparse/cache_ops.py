@@ -107,7 +107,9 @@ def allocate_mapped_host(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Te
     owner = torch.empty(allocated_bytes + mmap.PAGESIZE - 1, dtype=torch.uint8, pin_memory=True)
     offset = (-owner.data_ptr()) % mmap.PAGESIZE
     raw = owner[offset : offset + allocated_bytes]
-    mapping = MappedHostTensor(raw)
+    from vllm_ascend.hisparse import a3_eager
+
+    mapping = a3_eager.PinnedHostTensor(raw) if a3_eager.enabled() else MappedHostTensor(raw)
     tensor = raw[:nbytes].view(dtype).view(shape)
     # Both aliases retain the pinned allocation. Runtime owns the registration
     # through this base tensor until its explicit, drained shutdown.
@@ -129,10 +131,12 @@ class ResolverWorkspace:
         self.max_topk = hot_size if max_topk is None else max_topk
         if not 0 < self.max_topk <= hot_size:
             raise ValueError("HiSparse resolver TopK capacity must be positive and fit the Hot cache")
+        from vllm_ascend.hisparse import a3_eager
         from vllm_ascend.hisparse.resolver import _load_resolver, scratch_layout
 
-        self.native = _load_resolver()
-        scratch_layout(hot_size, max_union_rows, self.native.hisparse_resolver_scratch_capacity())
+        self.native = None if a3_eager.enabled() else _load_resolver()
+        if self.native is not None:
+            scratch_layout(hot_size, max_union_rows, self.native.hisparse_resolver_scratch_capacity())
         # One resolved Host row per selected token, not per Hot-cache slot.
         self.first_refs = torch.empty(max_rows * self.max_topk, dtype=torch.int32, device=device)
         self.errors = torch.zeros((max_rows, 8), dtype=torch.int32, device=device)
@@ -326,9 +330,13 @@ class HiSparseNPUOps:
             != 1
         ):
             raise ValueError("All three compact HiSparse swap outputs are required together")
+        from vllm_ascend.hisparse import a3_eager
         from vllm_ascend.hisparse.resolver import resolve
 
-        resolve(self, locals())
+        if a3_eager.enabled():
+            a3_eager.resolve(self, locals())
+        else:
+            resolve(self, locals())
 
     def hisparse_gather_compact(
         self, host_cache, hot_cache, miss_global_indices, miss_hot_indices, miss_counts
@@ -381,6 +389,13 @@ class HiSparseNPUOps:
             if attention_block < block_size:
                 raise ValueError("HiSparse attention block stride must cover a physical block")
         if rows == 0 or topk == 0:
+            return
+        from vllm_ascend.hisparse import a3_eager
+
+        if a3_eager.enabled():
+            if self.host_mapping.closed:
+                raise ValueError("A3 HiSparse Host pool is closed")
+            a3_eager.gather(host_cache, hot_cache, source, destination, counts, mask, state, attention, attention_block)
             return
         parallel_columns = min(topk, 128) if counts is not None else 0
         gather_rows_kernel[(rows, parallel_columns or topk)](
