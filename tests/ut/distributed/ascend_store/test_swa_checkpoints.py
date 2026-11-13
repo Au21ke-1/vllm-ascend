@@ -3,6 +3,7 @@
 """Checkpoint save/query contracts using upstream SWA algorithms (CPU only)."""
 
 import inspect
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -15,6 +16,7 @@ from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, Slid
 from vllm.v1.kv_cache_interface import CircularBufferSpec, FullAttentionSpec, KVCacheGroupSpec, SlidingWindowSpec
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator import AscendStoreCoordinator
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.pool_scheduler import LayerwiseKVPoolScheduler
 
 pytestmark = pytest.mark.skipif(
     "reachable_boundaries" not in inspect.signature(SlidingWindowManager.reachable_block_mask).parameters,
@@ -131,3 +133,46 @@ def test_lookup_also_recovers_nonperiodic_replay_checkpoint():
     coord = make_coordinator(2048)
     pool = save(coord, end=14208, prompt=14209)
     assert lookup(coord, pool, changed_suffix()) == 14208
+
+
+@pytest.mark.parametrize(
+    "prompt_tokens,interval,expected",
+    [
+        (2048, 2048, 0),
+        (4096, 2048, 2048),
+        (2049, 2048, 2048),
+        (16384, 2048, 16256),
+        (16385, 2048, 16384),
+        (2048, None, 1920),
+        (128, 2048, None),
+    ],
+)
+def test_private_state_lookup_checks_the_window_at_the_actual_resume_boundary(prompt_tokens, interval, expected):
+    coord = make_coordinator(interval)
+    pool = save(coord)
+    scheduler = object.__new__(LayerwiseKVPoolScheduler)
+    scheduler.use_block_key_layerwise = False
+    scheduler.use_layerwise_transfer = True
+    scheduler.cacheable_group_ids = coord.cacheable_group_ids
+    scheduler.original_block_size = [BLOCK_SIZE] * 4
+    scheduler.cache_transfer_granularity = BLOCK_SIZE
+    request = SimpleNamespace(prompt_token_ids=[0] * prompt_tokens, block_hashes=hashes())
+
+    def query(group_id, group_hashes, mask):
+        return [
+            block_hash
+            for index, block_hash in enumerate(group_hashes)
+            if (mask is None or mask[index]) and (group_id, block_hash) in pool
+        ]
+
+    scheduler._get_layerwise_hit_tokens = lambda request, length, computed: coord.find_reachable_hit_tokens(
+        request.block_hashes, length, query
+    )
+    hit = scheduler._lookup_external_hit_tokens(request, 0)
+    assert hit == expected
+    if hit:
+        assert hit < prompt_tokens
+        for group_id, mask in enumerate(coord.load_mask(request.block_hashes, hit)):
+            assert all(
+                not required or (group_id, request.block_hashes[index]) in pool for index, required in enumerate(mask)
+            )
