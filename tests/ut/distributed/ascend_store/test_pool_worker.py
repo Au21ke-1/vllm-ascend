@@ -29,7 +29,13 @@ import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 # isort: split
 import torch
 from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec, MambaSpec, UniformTypeKVCacheSpecs
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheGroupSpec,
+    MambaSpec,
+    SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
+)
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector import (
     AscendStoreConnector,
@@ -119,6 +125,7 @@ def make_worker(
     layer_offset=0,
     pp_partition=None,
     cache_block_size=16,
+    retention_interval=0,
 ):
     module = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker"
     start_patch(test, f"{module}.get_tensor_model_parallel_rank", return_value=tp_rank)
@@ -171,6 +178,7 @@ def make_worker(
     if kv_cache_config is not None:
         config.scheduler_config.disable_hybrid_kv_cache_manager = False
     config.cache_config.block_size = cache_block_size
+    config.cache_config.prefix_cache_retention_interval = retention_interval
     config.cache_config.prefix_match_unit = prefix_match_unit
     config.kv_events_config = None
     if enable_kv_events:
@@ -3418,6 +3426,25 @@ class TestKVPoolWorkerTpMismatch(unittest.TestCase):
 class TestKVPoolWorkerReachableMasks(unittest.TestCase):
     """Layerwise reachable-mask filtering on the save/load paths."""
 
+    def test_worker_uses_cache_config_checkpoint_interval_and_detects_swa(self):
+        common = dict(block_size=128, num_kv_heads=1, head_size=16, dtype=torch.float32)
+        groups = [
+            KVCacheGroupSpec(["main"], FullAttentionSpec(**common)),
+            KVCacheGroupSpec(["swa"], SlidingWindowSpec(**common, sliding_window=512)),
+        ]
+        for interval in (None, 0, 2048):
+            with self.subTest(interval=interval):
+                worker = make_worker(
+                    self,
+                    extra_config={"backend": "memcache"},
+                    use_layerwise=True,
+                    cache_block_size=128,
+                    kv_cache_config=SimpleNamespace(kv_cache_groups=groups),
+                    retention_interval=interval,
+                )
+                self.assertEqual(worker.cache_coordinator.retention_interval, interval)
+                self.assertEqual(worker.group_uses_sliding_window, [False, True])
+
     def _make_worker(self):
         worker = make_worker(self, extra_config={"backend": "memcache"}, use_layerwise=True)
         worker.layerwise_offload = True
@@ -3471,6 +3498,33 @@ class TestKVPoolWorkerReachableMasks(unittest.TestCase):
         expected = ([False, True],)
         worker.token_database.store_mask = MagicMock(return_value=expected)
         self.assertEqual(worker._compute_reachable_store_masks(request), expected)
+
+    def test_swa_recycled_slots_do_not_allocate_readable_checkpoint_keys(self):
+        worker = self._make_worker()
+        worker.cache_coordinator = object()
+        worker.group_uses_sliding_window = [True]
+        worker.group_uses_align_state = [False]
+        worker.token_database.store_mask = MagicMock(return_value=([True, True, False, True],))
+        request = self._make_request(block_ids=[0, 11, 12, 13], block_ids_by_group=[[0, 11, 12, 13]])
+        request.store_masks = worker._compute_reachable_store_masks(request)
+        self.assertEqual(request.store_masks, ([False, True, False, True],))
+        worker.m_store.batch_alloc.return_value = [101, 103]
+
+        worker._alloc_gvas_for_save([request])
+
+        self.assertEqual(worker.m_store.batch_alloc.call_args.args[0], ["llama-7b@h1@0", "llama-7b@h3@0"])
+        worker._process_save_for_layer_batch([request], 0)
+        ranges = worker.layer_save_tasks[0][0].block_ranges
+        self.assertEqual([(item.start_block, item.end_block) for item in ranges], [(1, 2), (3, 4)])
+
+    def test_swa_chunk_end_does_not_create_an_unselected_checkpoint(self):
+        worker = self._make_worker()
+        worker.cache_coordinator = object()
+        worker.group_uses_sliding_window = [True]
+        worker.group_uses_align_state = [False]
+        worker.token_database.store_mask = MagicMock(return_value=([False, True, False, False],))
+        request = self._make_request(num_prompt_tokens=128, block_ids_by_group=[[10, 11, 12, 13]])
+        self.assertEqual(worker._compute_reachable_store_masks(request), ([False, True, False, False],))
 
     def test_aligned_prefill_chunk_preserves_real_recurrent_checkpoint(self):
         worker = self._make_worker()

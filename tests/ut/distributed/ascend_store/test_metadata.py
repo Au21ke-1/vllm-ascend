@@ -18,7 +18,7 @@
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.metadata import (
@@ -37,11 +37,32 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     get_block_hashes,
     get_group_block_size,
     get_group_cache_family,
+    get_prefix_cache_retention_interval,
     infer_cache_transfer_granularity,
     infer_dcp_mismatch_info,
     infer_group_block_sizes,
     uses_hybrid_kv_cache,
 )
+
+
+class TestCheckpointRetentionConfig(unittest.TestCase):
+    def test_cache_config_wins_over_legacy_environment(self):
+        with patch(
+            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata.envs."
+            "VLLM_PREFIX_CACHE_RETENTION_INTERVAL",
+            4096,
+            create=True,
+        ):
+            for interval in (None, 0, 2048):
+                with self.subTest(interval=interval):
+                    config = SimpleNamespace(prefix_cache_retention_interval=interval)
+                    self.assertEqual(get_prefix_cache_retention_interval(config), interval)
+            self.assertEqual(get_prefix_cache_retention_interval(SimpleNamespace()), 4096)
+
+    def test_invalid_interval_fails_instead_of_silently_using_dense_retention(self):
+        for interval in (-1, True, "2048", 1.5):
+            with self.subTest(interval=interval), self.assertRaises(ValueError):
+                get_prefix_cache_retention_interval(SimpleNamespace(prefix_cache_retention_interval=interval))
 
 
 class TestCacheLayoutHelpers(unittest.TestCase):

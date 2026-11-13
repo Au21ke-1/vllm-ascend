@@ -24,6 +24,10 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
+
+# isort: split
 import torch
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -38,7 +42,6 @@ from zmq.constants import RCVTIMEO, REP
 from zmq.error import ZMQError
 from zmq.sugar.context import Context
 
-import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector import create_kv_pool_scheduler
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import backend_map, get_backend_class
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator import AscendStoreCoordinator
@@ -209,12 +212,31 @@ def make_config(kv_role="kv_producer", extra_config=None, block_size=16):
     config.parallel_config.world_size = 1
     config.cache_config.block_size = block_size
     config.cache_config.hash_block_size = block_size
+    config.cache_config.prefix_cache_retention_interval = 0
     config.model_config.model = "org/llama-7b"
     config.model_config.use_mla = False
     config.model_config.hf_text_config = MagicMock(spec=[])
     config.model_config.get_total_num_kv_heads.return_value = 1
     config.model_config.get_num_layers.return_value = 2
     return config
+
+
+@pytest.mark.parametrize("interval", [None, 0, 2048])
+def test_scheduler_uses_cache_config_checkpoint_interval(interval):
+    config = make_config(extra_config={"backend": "memcache"}, block_size=128)
+    config.cache_config.prefix_cache_retention_interval = interval
+    config.scheduler_config.disable_hybrid_kv_cache_manager = False
+    common = dict(block_size=128, num_kv_heads=1, head_size=16, dtype=torch.float32)
+    groups = [
+        KVCacheGroupSpec(["main"], FullAttentionSpec(**common)),
+        KVCacheGroupSpec(["swa"], SlidingWindowSpec(**common, sliding_window=512)),
+    ]
+    with patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient"):
+        scheduler = create_kv_pool_scheduler(
+            config, use_layerwise=True, kv_cache_config=SimpleNamespace(kv_cache_groups=groups)
+        )
+    assert scheduler.retention_interval == interval
+    assert scheduler.cache_coordinator.retention_interval == interval
 
 
 @pytest.mark.parametrize("num_speculative_blocks", [None, 0, 3])
@@ -686,6 +708,7 @@ class TestKVPoolSchedulerBuildMeta(unittest.TestCase):
         config.parallel_config.world_size = 1
         config.cache_config.block_size = block_size
         config.cache_config.hash_block_size = block_size
+        config.cache_config.prefix_cache_retention_interval = 0
         # Concrete model_config values so KVPoolScheduler.__init__ int math
         # (num_kv_head < tp_size, get_num_layers, model name split, ...) works.
         config.model_config.model = "org/llama-7b"
@@ -1585,6 +1608,7 @@ class TestKVPoolSchedulerMambaGroups(unittest.TestCase):
         config.parallel_config.world_size = 1
         config.cache_config.block_size = 16
         config.cache_config.hash_block_size = 16
+        config.cache_config.prefix_cache_retention_interval = 0
         # Concrete model_config values so KVPoolScheduler.__init__ int math
         # (num_kv_head < tp_size, get_num_layers, model name split, ...) works.
         config.model_config.model = "org/llama-7b"

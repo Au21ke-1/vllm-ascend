@@ -22,6 +22,7 @@ from vllm.v1.core.kv_cache_utils import BlockHash, maybe_convert_block_hash
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     MambaSpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 
@@ -53,6 +54,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     ReqMeta,
     get_block_hashes,
     get_group_cache_family,
+    get_prefix_cache_retention_interval,
     infer_cache_transfer_granularity,
     infer_cacheable_group_ids,
     infer_group_block_sizes,
@@ -216,6 +218,7 @@ class BaseKVPoolWorker(ABC):
         self.num_kv_cache_groups = len(self.grouped_block_size)
         self.kv_cache_group_families = infer_group_cache_families(kv_cache_groups, self.compress_ratios, self.hf_config)
         self.group_uses_align_state = self._infer_group_uses_align_state()
+        self.group_uses_sliding_window = self._infer_group_uses_sliding_window()
         self.cache_transfer_granularity = infer_cache_transfer_granularity(
             self.grouped_block_size, self.lcm_block_size, self.cacheable_group_ids
         )
@@ -401,9 +404,7 @@ class BaseKVPoolWorker(ABC):
         speculative_config = getattr(vllm_config, "speculative_config", None)
         use_eagle_fn = getattr(speculative_config, "use_eagle", None)
         use_eagle = bool(use_eagle_fn()) if callable(use_eagle_fn) else False
-        retention_interval = getattr(envs, "VLLM_PREFIX_CACHE_RETENTION_INTERVAL", None)
-        if not isinstance(retention_interval, int):
-            retention_interval = None
+        retention_interval = get_prefix_cache_retention_interval(vllm_config.cache_config)
         return AscendStoreCoordinator(
             self.kv_cache_config.kv_cache_groups,
             scheduler_block_size=self.cache_transfer_granularity,
@@ -413,6 +414,16 @@ class BaseKVPoolWorker(ABC):
             use_eagle=use_eagle,
             retention_interval=retention_interval,
         )
+
+    def _infer_group_uses_sliding_window(self) -> list[bool]:
+        if self.kv_cache_config is None:
+            return [False]
+        result = []
+        for group in self.kv_cache_config.kv_cache_groups:
+            spec = group.kv_cache_spec
+            specs = spec.kv_cache_specs.values() if isinstance(spec, UniformTypeKVCacheSpecs) else (spec,)
+            result.append(any(isinstance(item, SlidingWindowSpec) for item in specs))
+        return result
 
     def _infer_group_uses_align_state(self) -> list[bool]:
         if self.kv_cache_config is None:

@@ -83,6 +83,7 @@ _vllm_mock_modules = [
     "vllm.distributed.kv_transfer.kv_connector.v1",
     "vllm.distributed.kv_transfer.kv_connector.v1.base",
     "vllm.distributed.kv_transfer.kv_connector.v1.metrics",
+    "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.protocol",
     "vllm.distributed.parallel_state",
     "vllm.envs",
     "vllm.forward_context",
@@ -122,6 +123,7 @@ _vllm_mock_modules = [
     "vllm.v1.request",
     "vllm.v1.serial_utils",
     "vllm.v1.worker",
+    "vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils",
 ]
 if _MOCK_VLLM_DEPS:
     for _mod_name in _vllm_mock_modules:
@@ -468,6 +470,11 @@ _vllm_ascend_package_paths = {
 for _pkg, _path in _vllm_ascend_package_paths.items():
     if _pkg not in sys.modules:
         sys.modules[_pkg] = _make_pkg(_pkg, _path)
+
+if _MOCK_VLLM_DEPS and "vllm_ascend._build_info" not in sys.modules:
+    _build_info = types.ModuleType("vllm_ascend._build_info")
+    _build_info.__soc_version__ = "ASCEND910B1"
+    sys.modules["vllm_ascend._build_info"] = _build_info
 
 _distributed_utils = types.ModuleType("vllm_ascend.distributed.utils")
 _distributed_utils.all_gather_async = MagicMock()  # type: ignore[attr-defined]

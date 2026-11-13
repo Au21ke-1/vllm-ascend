@@ -91,6 +91,54 @@ with vLLM v0.33.0 on eight 950DT devices. Layerwise execution waits for both
 main KV and summary loads, updates summaries before opening the attention
 transfer window, and saves once per physical layer after attention submission.
 
+### Periodic SWA recovery checkpoints
+
+For prompts sharing only part of their prefix, retain intermediate SWA windows
+with the existing vLLM option (v0.33.0):
+
+```bash
+--no-enable-prefix-caching --prefix-cache-retention-interval 2048
+```
+
+Add these arguments to the existing launch command and use the same retention
+setting on the engines sharing the pool. Keep `use_layerwise=true` and the hybrid
+cache manager enabled. SSD offload is not required. Local prefix caching can
+remain disabled while validating external reuse.
+
+The pool scheduler and worker read `CacheConfig.prefix_cache_retention_interval`,
+the same source used by the Step-5 KV cache planner. `0` retains replay-boundary
+checkpoints only; a positive value adds periodic checkpoints; `None` uses dense
+retention. Choose a positive interval aligned with the cache transfer granularity
+(for example 2048 for 128-token blocks). A very small interval can make retained
+SWA windows overlap and approach dense storage. The legacy environment variable
+is consulted only on older vLLM versions without this config field.
+
+Saving reuses the upstream SWA reachable-block mask. Window pieces are saved as
+their complete blocks become available, including across prefill chunks. Recycled
+null slots are excluded from both pool allocation and transfer tasks. Main KV and
+CSA summaries keep their existing storage rules; the private tail ring remains
+excluded. Existing layerwise events and final save drains protect source buffers.
+
+Lookup reuses the multi-group coordinator and upstream longest-hit search. It
+accepts the latest complete recovery point at or before the common prefix,
+requiring main KV, summaries and the necessary SWA window. Missing objects cause
+fallback to an earlier point or a miss. Previously stored replay boundaries are
+also valid candidates; lookup is not restricted to periodic boundaries.
+
+For 16384 input tokens, 14720 complete shared tokens, 128-token blocks, a 512-token
+SWA window and a 2048-token interval, a freshly warmed complete pool can recover
+at 14336. The remaining 2048 input tokens are recomputed, including 384 shared
+tokens after the checkpoint. These numbers assume non-speculative lookup and no
+eviction; verify the actual window, alignment and speculative settings.
+
+Warm the pool again after changing retention: the setting cannot create missing
+historical windows. Validate using a fresh test pool, exact token prefixes and
+deterministic output comparisons against a no-reuse baseline. Also remove a
+required checkpoint object to verify fallback. Query success alone is not proof
+that a subsequent load completed; keep `kv_load_failure_policy=recompute` and
+check load outcomes. This checkpoint extension has CPU logic coverage; Step-5
+NPU execution, MTP and PP2/TP4 to DP1/TP8 deployment still require device validation.
+
 ## Scenario 1: Mooncake Backend
 
 ### Configuration Examples

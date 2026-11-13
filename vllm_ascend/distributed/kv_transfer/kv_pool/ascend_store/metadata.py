@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
+import vllm.envs as envs
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata, KVConnectorWorkerMetadata
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
@@ -22,6 +23,21 @@ if TYPE_CHECKING:
 
 def is_kv_save_role(kv_role: str, consumer_is_to_put: bool) -> bool:
     return kv_role in ("kv_producer", "kv_both") or consumer_is_to_put
+
+
+def get_prefix_cache_retention_interval(cache_config: Any) -> int | None:
+    """Use the same retention policy as the local KV cache manager.
+
+    None means dense retention, zero means replay checkpoints only, and a
+    positive value adds periodic checkpoints. Only older vLLM versions that
+    lack the config field may fall back to the legacy environment setting.
+    """
+    interval = getattr(cache_config, "prefix_cache_retention_interval", ...)
+    if interval is ...:
+        interval = getattr(envs, "VLLM_PREFIX_CACHE_RETENTION_INTERVAL", None)
+    if interval is not None and (type(interval) is not int or interval < 0):
+        raise ValueError("prefix_cache_retention_interval must be None or a non-negative integer")
+    return interval
 
 
 @dataclass(frozen=True)

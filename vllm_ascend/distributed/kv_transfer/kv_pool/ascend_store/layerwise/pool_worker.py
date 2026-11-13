@@ -1527,15 +1527,18 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
             except AssertionError:
                 masks = None
         align_groups = getattr(self, "group_uses_align_state", [])
-        if not any(align_groups):
+        sliding_groups = getattr(self, "group_uses_sliding_window", [])
+        if not any(align_groups) and not any(sliding_groups):
             return masks
-        # Mamba align slots can be null even when their token range is
-        # reachable. They do not contain a state snapshot. Do not allocate
-        # readable pool keys or copy block zero for these holes; the
-        # non-layerwise path applies the same skip_null_blocks rule.
+        # Mamba align slots and recycled SWA slots can be null even when
+        # their token range belongs to a retained checkpoint. Such holes do
+        # not contain valid state. Filter them before both GVA allocation
+        # and save-task construction, so they cannot become readable keys.
         result: list[list[bool] | None] = list(masks) if masks is not None else [None] * self.num_kv_cache_groups
-        for group_id, uses_align in enumerate(align_groups):
-            if not uses_align:
+        for group_id in range(self.num_kv_cache_groups):
+            uses_align = group_id < len(align_groups) and align_groups[group_id]
+            uses_sliding = group_id < len(sliding_groups) and sliding_groups[group_id]
+            if not uses_align and not uses_sliding:
                 continue
             block_ids = request.block_ids_by_group[group_id]
             original_mask = result[group_id]
@@ -1544,7 +1547,8 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
             # even when it is not the final prompt replay boundary. Keep that
             # checkpoint before the next chunk moves/reuses its state slots.
             chunk_checkpoint = (
-                request.num_prompt_tokens is not None
+                uses_align
+                and request.num_prompt_tokens is not None
                 and request.target_token_len == request.save_end_token
                 and request.save_end_token % self.cache_transfer_granularity == 0
                 and 0 < request.target_token_len < request.num_prompt_tokens

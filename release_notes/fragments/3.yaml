@@ -1,0 +1,4 @@
+pr: 3
+entries:
+  - category: bugfix
+    text: Aligned external KV pool checkpoint retention with CacheConfig and excluded recycled SWA slots from layerwise saves, enabling periodic Step-5 prefix recovery checkpoints.
